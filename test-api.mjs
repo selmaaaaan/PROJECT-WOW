@@ -1,0 +1,46 @@
+import {spawn} from 'node:child_process';
+import {once} from 'node:events';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+const dataDir=path.resolve(process.env.TEST_DATA_DIR||'../../work/discover-test-'+Date.now());fs.mkdirSync(dataDir,{recursive:true});
+let child;async function start(){child=spawn(process.execPath,['backend.mjs'],{env:{...process.env,PORT:'4174',UNSEEN_DATA_DIR:dataDir,OPENAI_API_KEY:'',OPENAI_MODEL:''},stdio:['ignore','pipe','pipe']});await Promise.race([once(child.stdout,'data'),once(child,'exit').then(()=>{throw new Error('Test server exited early')})])}await start();
+const base='http://127.0.0.1:4174';let checks=0;
+async function call(route,method='GET',data,cookie='',expected=200,origin){const r=await fetch(base+'/api'+route,{method,headers:{'Content-Type':'application/json',Cookie:cookie,...(origin?{Origin:origin}:{})},body:data?JSON.stringify(data):undefined});const out=await r.json();assert.equal(r.status,expected,route+': '+JSON.stringify(out));checks++;return {...out,cookie:r.headers.get('set-cookie')?.split(';')[0]}}
+try{
+assert.equal((await call('/config')).setupRequired,true);
+const admin=await call('/setup','POST',{name:'Test Manager',institution:'Test College',email:'admin@example.test',password:'Manager-pass-123'});
+await call('/setup','POST',{name:'Other',institution:'Bad',email:'other@example.test',password:'password123'},'',409);
+const invite=await call('/invitations','POST',{email:'teacher@example.test',role:'teacher'},admin.cookie);
+await call('/register','POST',{name:'Bad Teacher',email:'bad@example.test',role:'teacher',password:'password123',code:invite.code},'',403);
+const teacher=await call('/register','POST',{name:'Test Teacher',email:'teacher@example.test',role:'teacher',password:'Teacher-pass-123',code:invite.code});
+const student=await call('/register','POST',{name:'Test Student',email:'student@example.test',role:'student',password:'Student-pass-123',code:admin.joinCode});
+await call('/management','GET',null,student.cookie,403);await call('/students','GET',null,student.cookie,403);await call('/opportunities','POST',{},student.cookie,403);
+await call('/profile','PUT',{name:'Test Student',skills:['Coding','Python'],course:'Computer science',bio:'I enjoy building things.',discoverable:true},student.cookie);
+assert.equal((await call('/students','GET',null,teacher.cookie)).students.length,1);
+const o=await call('/opportunities','POST',{title:'Coding webinar',description:'Learn to write a small Python program in a practical group workshop.',type:'Webinar',skills:['Coding'],deadline:''},teacher.cookie);assert.equal(o.notified,1);
+assert.equal((await call('/notifications','GET',null,student.cookie)).notifications.length,1);
+assert.equal((await call('/opportunities/'+o.id+'/suggest','POST',{},teacher.cookie)).notified,0);
+await call('/opportunities/'+o.id+'/invite','POST',{student:student.user.id,message:'Please join our practical coding workshop.'},teacher.cookie);
+await call('/opportunities/'+o.id+'/apply','POST',{message:'I want to explore coding and build my first useful program.'},student.cookie);
+await call('/opportunities/'+o.id+'/apply','POST',{message:'This is a second application that should be rejected.'},student.cookie,409);
+const apps=(await call('/applications','GET',null,teacher.cookie)).applications;assert.equal(apps.length,1);
+await call('/applications/'+apps[0].id,'PUT',{status:'Selected'},teacher.cookie);
+assert.equal((await call('/applications','GET',null,student.cookie)).applications[0].status,'Selected');
+const i2=await call('/invitations','POST',{email:'teacher2@example.test',role:'teacher'},admin.cookie);
+const t2=await call('/register','POST',{name:'Other Teacher',email:'teacher2@example.test',role:'teacher',password:'Other-pass-123',code:i2.code});
+await call('/applications/'+apps[0].id,'PUT',{status:'Not selected'},t2.cookie,403);
+assert.equal((await call('/applications','GET',null,t2.cookie)).applications.length,0);
+await call('/opportunities/'+o.id+'/status','POST',{status:'closed'},t2.cookie,403);
+await call('/profile','PUT',{name:'Test Student',skills:['Coding'],discoverable:false},student.cookie);
+assert.equal((await call('/students','GET',null,teacher.cookie)).students.length,0);
+assert((await call('/discover','POST',{answers:'I love coding and explaining programs to other students.',useAI:false},student.cookie)).skills.includes('Coding'));
+await call('/discover','POST',{answers:'I love coding and explaining programs to other students.',useAI:true},student.cookie,503);
+await call('/profile','PUT',{name:'Test Student',skills:['Coding']},student.cookie,403,'https://malicious.test');
+await call('/login','POST',{email:'student@example.test',password:'Student-pass-123',role:'management'},'',401);
+child.kill();await once(child,'exit');await start();assert.equal((await call('/me','GET',null,student.cookie)).user.name,'Test Student');
+assert.equal((await call('/opportunities','GET',null,teacher.cookie)).opportunities.length,1);
+await call('/logout','POST',{},student.cookie);assert.equal((await call('/me','GET',null,student.cookie)).user,null);
+const page=await fetch(base+'/discover');assert.equal(page.status,200);assert((await page.text()).includes('/discover.js'));
+console.log(`PASS: ${checks} API checks. Accounts, roles, invitations, skill matching, notifications, applications, teacher ownership, privacy opt-out, AI fallback, CSRF, logout, restart persistence, and direct routes.`);
+}finally{child.kill()}

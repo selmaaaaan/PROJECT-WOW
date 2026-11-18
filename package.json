@@ -1,0 +1,1 @@
+{"name":"unseen-discover","version":"2.0.0","private":true,"type":"module","engines":{"node":">=24"},"scripts":{"dev":"node server.mjs","start":"node server.mjs","check":"node --check backend.mjs && node --check dist/discover.js","test":"node test-api.mjs"}}
